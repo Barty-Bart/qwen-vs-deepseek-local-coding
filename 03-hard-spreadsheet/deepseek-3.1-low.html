@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spreadsheet</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #f5f6f8;
+  }
+  #app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  #formula-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: #fff;
+    border-bottom: 1px solid #d4d7dc;
+    font-size: 13px;
+  }
+  #formula-bar .fx {
+    font-style: italic;
+    font-weight: bold;
+    color: #888;
+    padding: 4px 8px;
+    border-right: 1px solid #d4d7dc;
+    user-select: none;
+  }
+  #formula-input {
+    flex: 1;
+    border: 1px solid transparent;
+    outline: none;
+    font-size: 13px;
+    padding: 4px 6px;
+    font-family: inherit;
+    border-radius: 3px;
+  }
+  #formula-input:focus {
+    border-color: #3b82f6;
+  }
+  #status {
+    color: #666;
+    font-size: 12px;
+    min-width: 60px;
+    text-align: right;
+    white-space: nowrap;
+  }
+  #grid-wrap {
+    flex: 1;
+    overflow: auto;
+    position: relative;
+  }
+  table {
+    border-collapse: collapse;
+    table-layout: fixed;
+    width: max-content;
+    min-width: 100%;
+  }
+  th, td {
+    border: 1px solid #d4d7dc;
+    height: 26px;
+    box-sizing: border-box;
+  }
+  th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #e8eaed;
+    color: #444;
+    font-weight: 600;
+    font-size: 12px;
+    text-align: center;
+    user-select: none;
+  }
+  th.corner {
+    z-index: 3;
+    left: 0;
+    min-width: 42px;
+    width: 42px;
+    cursor: cell;
+    background: #e0e3e7;
+  }
+  th.colh {
+    min-width: 90px;
+    width: 90px;
+    cursor: cell;
+  }
+  th.rowh {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: #e8eaed;
+    min-width: 42px;
+    width: 42px;
+  }
+  td {
+    position: relative;
+    background: #fff;
+    cursor: cell;
+  }
+  td.edit-mode {
+    padding: 0;
+  }
+  td .cell-display {
+    padding: 0 6px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-align: right;
+  }
+  td.number .cell-display {
+    text-align: right;
+  }
+  td.text .cell-display {
+    text-align: left;
+  }
+  td.edit-mode input {
+    width: 100%;
+    height: 100%;
+    border: none;
+    outline: none;
+    padding: 0 6px;
+    margin: 0;
+    box-sizing: border-box;
+    font-size: 13px;
+    font-family: inherit;
+    background: #fff;
+    text-align: right;
+  }
+  td.selected .cell-display {
+    outline: 2px solid #3b82f6;
+    outline-offset: -2px;
+  }
+  td.editing {
+    outline: 2px solid #10b981;
+    outline-offset: -2px;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="formula-bar">
+    <span class="fx">fx</span>
+    <input id="formula-input" type="text" spellcheck="false" autocomplete="off">
+    <span id="status"></span>
+  </div>
+  <div id="grid-wrap">
+    <table id="grid" cellspacing="0"></table>
+  </div>
+</div>
+<script>
+(function () {
+  'use strict';
+
+  var COLS = 10;   // A..J
+  var ROWS = 20;   // 1..20
+
+  var cells = {};          // ref -> { raw, value, deps: [refs], dependsOn: [refs] }
+  var displayDivs = {};    // ref -> div
+  var inputs = {};         // ref -> input element
+  var orderStack = [];     // DFS order stack for cycle detection
+  var onChange = null;     // hook used by tests
+
+  // ---------- coordinate helpers ----------
+  function colToName(c) { return String.fromCharCode(65 + c); }
+  function rowToName(r) { return String(r + 1); }
+  function toRef(c, r) { return colToName(c) + rowToName(r); }
+  function parseRef(name) {
+    var m = /^([A-Z])([1-9][0-9]*)$/.exec(name.toUpperCase());
+    if (!m) return null;
+    var c = m[1].charCodeAt(0) - 65;
+    var r = parseInt(m[2], 10) - 1;
+    if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return null;
+    return { c: c, r: r };
+  }
+
+  // ---------- tokenizer ----------
+  function tokenize(s) {
+    var tokens = [];
+    var i = 0;
+    var n = s.length;
+    while (i < n) {
+      var ch = s[i];
+      if (ch === ' ' || ch === '\t') { i++; continue; }
+      if (ch >= '0' && ch <= '9') {
+        var start = i;
+        var sawDot = false;
+        while (i < n) {
+          var d = s[i];
+          if (d >= '0' && d <= '9') { i++; }
+          else if (d === '.' && !sawDot && i + 1 < n && s[i + 1] >= '0' && s[i + 1] <= '9') { sawDot = true; i++; }
+          else break;
+        }
+        tokens.push({ type: 'num', value: parseFloat(s.slice(start, i)) });
+        continue;
+      }
+      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
+        var j = i;
+        while (j < n && /[A-Za-z0-9]/.test(s[j])) j++;
+        var word = s.slice(i, j);
+        var mu = /^([A-Z])([1-9][0-9]*)$/.exec(word.toUpperCase());
+        if (mu) {
+          tokens.push({ type: 'ref', value: mu[1] + mu[2] });
+        } else {
+          tokens.push({ type: 'ident', value: word });
+        }
+        i = j;
+        continue;
+      }
+      if (ch === '+') { tokens.push({ type: '+', value: ch }); i++; continue; }
+      if (ch === '-') { tokens.push({ type: '-', value: ch }); i++; continue; }
+      if (ch === '*') { tokens.push({ type: '*', value: ch }); i++; continue; }
+      if (ch === '/') { tokens.push({ type: '/', value: ch }); i++; continue; }
+      if (ch === '(') { tokens.push({ type: '(', value: ch }); i++; continue; }
+      if (ch === ')') { tokens.push({ type: ')', value: ch }); i++; continue; }
+      if (ch === ',') { tokens.push({ type: ',', value: ch }); i++; continue; }
+      if (ch === ':') { tokens.push({ type: ':', value: ch }); i++; continue; }
+      if (ch === '=') { tokens.push({ type: 'eq', value: ch }); i++; continue; }
+      tokens.push({ type: 'bad', value: ch }); i++;
+    }
+    return tokens;
+  }
+
+  // ---------- parser ----------
+  // Returns {value, refs} or null on error.
+
+  function parseFormula(src) {
+    var toks = tokenize(src);
+    var pos = 0;
+
+    function peek() { return toks[pos]; }
+    function next() { return toks[pos++]; }
+    function isFnStart() {
+      var t = peek();
+      if (!t || t.type !== 'ident') return false;
+      var names = ['SUM', 'AVERAGE', 'MIN', 'MAX', 'COUNT'];
+      return names.indexOf(t.value.toUpperCase()) !== -1;
+    }
+    function lookaheadIsLParen() {
+      return toks[pos + 1] && toks[pos + 1].type === '(';
+    }
+
+    function err() { return null; }
+
+    // expr := term (('+'|'-') term)*
+    function parseExpr() {
+      var left = parseTerm();
+      if (left === null) return null;
+      while (true) {
+        var t = peek();
+        if (t && (t.type === '+' || t.type === '-')) {
+          next();
+          var right = parseTerm();
+          if (right === null) return null;
+          left = combine(left, right, t.type);
+        } else {
+          return left;
+        }
+      }
+    }
+
+    // term := factor (('*'|'/') factor)*
+    function parseTerm() {
+      var left = parseFactor();
+      if (left === null) return null;
+      while (true) {
+        var t = peek();
+        if (t && (t.type === '*' || t.type === '/')) {
+          next();
+          var right = parseFactor();
+          if (right === null) return null;
+          left = combine(left, right, t.type);
+        } else {
+          return left;
+        }
+      }
+    }
+
+    function combine(l, r, op) {
+      return {
+        kind: 'op',
+        op: op,
+        a: l,
+        b: r,
+        refs: l.refs.concat(r.refs)
+      };
+    }
+
+    // factor := num | ref | fn | '(' expr ')'
+    function parseFactor() {
+      var t = peek();
+      if (!t) return null;
+      if (t.type === 'num') {
+        next();
+        return { kind: 'num', value: t.value, refs: [] };
+      }
+      if (t.type === 'ref') {
+        next();
+        if (!parseRef(t.value)) return null;
+        return { kind: 'ref', value: t.value, refs: [t.value] };
+      }
+      if (t.type === 'ident' && lookaheadIsLParen()) {
+        return parseFn();
+      }
+      if (t.type === '(') {
+        next();
+        var e = parseExpr();
+        if (e === null) return null;
+        if (!peek() || peek().type !== ')') return null;
+        next();
+        return e;
+      }
+      return null;
+    }
+
+    function parseFn() {
+      var nameTok = next();
+      var name = nameTok.value.toUpperCase();
+      if (peek().type !== '(') return null;
+      next(); // consume '('
+      var args = [];
+      while (true) {
+        if (peek() && peek().type === ')') { next(); break; }
+        var a = parseArg();
+        if (a === null) return null;
+        args.push(a);
+        if (peek() && peek().type === ',') { next(); continue; }
+        if (peek() && peek().type === ')') { next(); break; }
+        return null;
+      }
+      return makeFnNode(name, args);
+    }
+
+    function parseArg() {
+      var t = peek();
+      if (!t) return null;
+      if (t.type === 'ref') {
+        // possible range: ref ':' ref
+        if (toks[pos + 1] && toks[pos + 1].type === ':') {
+          var startTok = next();       // ref
+          next();                      // ':'
+          var endTok = next();         // ref
+          if (startTok.type !== 'ref' || endTok.type !== 'ref') return null;
+          var refs = [];
+          var st = parseRef(startTok.value);
+          var en = parseRef(endTok.value);
+          if (!st || !en) return null;
+          var c1 = Math.min(st.c, en.c), c2 = Math.max(st.c, en.c);
+          var r1 = Math.min(st.r, en.r), r2 = Math.max(st.r, en.r);
+          for (var c = c1; c <= c2; c++) {
+            for (var r = r1; r <= r2; r++) {
+              refs.push(toRef(c, r));
+            }
+          }
+          return { kind: 'range', refs: refs, start: startTok.value, end: endTok.value };
+        }
+        next();
+        if (!parseRef(t.value)) return null;
+        return { kind: 'ref', value: t.value, refs: [t.value] };
+      }
+      if (t.type === 'num') {
+        next();
+        return { kind: 'num', value: t.value, refs: [] };
+      }
+      if (t.type === '(') {
+        next();
+        var e = parseExpr();
+        if (e === null) return null;
+        if (peek() && peek().type === ')') next();
+        else return null;
+        return e;
+      }
+      return null;
+    }
+
+    function makeFnNode(name, args) {
+      var refs = [];
+      args.forEach(function (a) { refs = refs.concat(a.refs); });
+      return { kind: 'fn', name: name, args: args, refs: refs };
+    }
+
+    // entry: expect "=" then expr then EOF
+    if (!toks.length || toks[0].type !== 'eq') return null;
+    pos = 1;
+    var node = parseExpr();
+    if (node === null) return null;
+    if (pos !== toks.length) return null;
+    return node;
+  }
+
+  // ---------- evaluator ----------
+  // throws {kind:'circular'} | {kind:'divzero'} on error
+
+  function toNum(v) {
+    if (typeof v === 'number') return v;
+    return 0;
+  }
+
+  function evalNode(node, stack) {
+    if (node.kind === 'num') return node.value;
+    if (node.kind === 'ref') return readRef(node.value, stack);
+    if (node.kind === 'op') {
+      var a = evalNode(node.a, stack);
+      var b = evalNode(node.b, stack);
+      switch (node.op) {
+        case '+': return a + b;
+        case '-': return a - b;
+        case '*': return a * b;
+        case '/':
+          if (b === 0) throw { kind: 'divzero' };
+          return a / b;
+      }
+    }
+    if (node.kind === 'fn') return evalFn(node, stack);
+    if (node.kind === 'range') return node; // not evaluated directly
+    throw { kind: 'error' };
+  }
+
+  function evalFn(node, stack) {
+    var name = node.name;
+    var vals = [];
+    var hasAny = false;
+    node.args.forEach(function (arg) {
+      if (arg.kind === 'range') {
+        arg.refs.forEach(function (ref) {
+          var v = readRef(ref, stack);
+          vals.push(v);
+          hasAny = true;
+        });
+      } else {
+        var v = evalNode(arg, stack);
+        vals.push(v);
+        hasAny = true;
+      }
+    });
+
+    var numbers = vals.filter(function (v) { return typeof v === 'number'; });
+    var countNums = numbers.length;
+
+    if (name === 'SUM') return sum(numbers);
+    if (name === 'AVERAGE') {
+      if (countNums === 0) throw { kind: 'error' };
+      return sum(numbers) / countNums;
+    }
+    if (name === 'MIN') {
+      if (countNums === 0) throw { kind: 'error' };
+      return Math.min.apply(null, numbers);
+    }
+    if (name === 'MAX') {
+      if (countNums === 0) throw { kind: 'error' };
+      return Math.max.apply(null, numbers);
+    }
+    if (name === 'COUNT') return countNums;
+    throw { kind: 'error' };
+  }
+
+  function sum(arr) {
+    var s = 0;
+    arr.forEach(function (v) { s += v; });
+    return s;
+  }
+
+  function readRef(ref, stack) {
+    if (stack.indexOf(ref) !== -1) throw { kind: 'circular' };
+    var c = cells[ref];
+    if (!c) return 0;
+    if (c.ast) {
+      stack.push(ref);
+      var v = evalNode(c.ast, stack);
+      stack.pop();
+      return v;
+    }
+    var cv = c.value;
+    if (typeof cv === 'object') {
+      if (cv.err === 'divzero') throw { kind: 'divzero' };
+      throw { kind: 'error' };
+    }
+    return toNum(cv);
+  }
+
+  // ---------- spreadsheet logic ----------
+
+  function setCell(ref, raw) {
+    if (!cells[ref]) cells[ref] = { raw: '', value: '', deps: [], dependsOn: [] };
+    cells[ref].raw = raw;
+    cells[ref].deps = [];
+    cells[ref].dependsOn = [];
+    cells[ref].invalid = false;
+    if (typeof raw === 'string' && raw.charAt(0) === '=') {
+      var ast = parseFormula(raw);
+      if (ast) {
+        cells[ref].ast = ast;
+        cells[ref].deps = ast.refs.slice();
+      } else {
+        cells[ref].ast = null;
+        cells[ref].value = { err: 'error' };
+        cells[ref].invalid = true;
+      }
+    } else if (raw === '' || raw === null || raw === undefined) {
+      cells[ref].ast = null;
+      cells[ref].value = '';
+    } else if (typeof raw === 'number') {
+      cells[ref].ast = null;
+      cells[ref].value = raw;
+    } else {
+      // plain text or number
+      cells[ref].ast = null;
+      cells[ref].value = plainValue(raw);
+    }
+  }
+
+  function plainValue(raw) {
+    var s = String(raw).trim();
+    if (s === '') return '';
+    var num = parseFloat(s);
+    if (isFinite(num) && /^[+-]?(\d+\.?\d*|\.\d+)$/.test(s)) {
+      return num;
+    }
+    return raw;
+  }
+
+  function recompute() {
+    // Propagate new deps into dependsOn lists.
+    for (var ref in cells) {
+      if (cells.hasOwnProperty(ref)) {
+        cells[ref].dependsOn = [];
+      }
+    }
+    for (var r2 in cells) {
+      if (cells.hasOwnProperty(r2)) {
+        cells[r2].deps.forEach(function (dep) {
+          if (cells[dep]) cells[dep].dependsOn.push(r2);
+        });
+      }
+    }
+    // Topologically reorder and detect cycles.
+    var order = [];
+    var state = {};
+    for (var r3 in cells) {
+      if (cells.hasOwnProperty(r3)) {
+        state[r3] = 0;
+      }
+    }
+    var selfRef = null;
+    var stack2 = [];
+    function visit(ref) {
+      var s = state[ref];
+      if (s === 2) return true;
+      if (s === 1) { selfRef = ref; return false; }
+      state[ref] = 1;
+      if (cells[ref]) {
+        var deps = cells[ref].deps;
+        for (var i = 0; i < deps.length; i++) {
+          var d = deps[i];
+          if (!state[d]) state[d] = 0; // maybe cell just created
+          if (!visit(d)) return false;
+          if (selfRef) return false;
+        }
+      }
+      state[ref] = 2;
+      if (cells[ref]) order.push(ref);
+      return true;
+    }
+    var cycleFree = true;
+    for (var r4 in cells) {
+      if (cells.hasOwnProperty(r4)) {
+        if (state[r4] === 0) {
+          if (!visit(r4)) { cycleFree = false; break; }
+        }
+      }
+    }
+    if (!cycleFree) {
+      markCycle(selfRef);
+      return;
+    }
+    // Clear previously computed values, then evaluate in order.
+    for (var r5 in cells) {
+      if (cells.hasOwnProperty(r5)) {
+        cells[r5].value = undefined;
+      }
+    }
+    for (var i2 = 0; i2 < order.length; i2++) {
+      var cr = order[i2];
+      var c = cells[cr];
+      if (c && c.ast) {
+        stack2.length = 0;
+        try {
+          c.value = evalNode(c.ast, stack2);
+        } catch (e) {
+          c.value = e && e.kind === 'divzero' ? { err: 'divzero' }
+                  : e && e.kind === 'circular' ? { err: 'circular' }
+                  : { err: 'error' };
+        }
+      } else if (c.invalid) {
+        c.value = { err: 'error' };
+      } else {
+        c.value = plainValue(c.raw);
+      }
+    }
+    // Clear cycle marks.
+    clearCycle();
+  }
+
+  function markCycle(ref) {
+    if (cells[ref]) {
+      cells[ref].value = { err: 'circular' };
+    }
+    // Also mark reverse-dependents.
+    var seen = {};
+    function walk(r) {
+      if (seen[r]) return;
+      seen[r] = true;
+      if (cells[r]) {
+        cells[r].value = { err: 'circular' };
+        (cells[r].dependsOn || []).forEach(walk);
+      }
+    }
+    walk(ref);
+  }
+
+  function clearCycle() {
+    for (var ref in cells) {
+      if (cells.hasOwnProperty(ref)) {
+        var v = cells[ref].value;
+        if (v && typeof v === 'object' && v.err === 'circular') {
+          cells[ref].value = undefined;
+        }
+      }
+    }
+  }
+
+  function valueToText(v) {
+    if (v === undefined || v === null) return '';
+    if (typeof v === 'object') {
+      if (v.err === 'circular') return '#CIRCULAR!';
+      if (v.err === 'divzero') return '#DIV/0!';
+      return '#ERROR!';
+    }
+    return String(v);
+  }
+
+  function cellClass(ref) {
+    var c = cells[ref];
+    if (!c) return 'text';
+    var v = c.value;
+    if (typeof v === 'object') return 'error';
+    if (typeof v === 'number') return 'number';
+    if (c.raw && String(c.raw).charAt(0) === '=') return 'number';
+    return 'text';
+  }
+
+  function isRefCell(ref) {
+    var c = cells[ref];
+    return !!c && typeof c.raw === 'string' && c.raw.charAt(0) === '=';
+  }
+
+  function refreshCell(ref, selectedRef) {
+    var c = cells[ref];
+    var div = displayDivs[ref];
+    var isSel = ref === selectedRef;
+    div.textContent = c ? valueToText(c.value) : '';
+    div.className = 'cell-display';
+    div.parentNode.className = (isSel ? 'selected ' : '') + cellClass(ref);
+    // Formula bar shows raw text for selected cell.
+    if (isSel && !div.parentNode.dataset.editing) {
+      // update handled in syncFormulaBar
+    }
+  }
+
+  // ---------- UI ----------
+
+  var grid = document.getElementById('grid');
+  var formulaInput = document.getElementById('formula-input');
+  var statusEl = document.getElementById('status');
+  var selected = { c: 0, r: 0 };
+  var selectedRef = toRef(0, 0);
+
+  // Build header row.
+  var thead = document.createElement('thead');
+  var headRow = document.createElement('tr');
+  var corner = document.createElement('th');
+  corner.className = 'corner';
+  headRow.appendChild(corner);
+  for (var c = 0; c < COLS; c++) {
+    var th = document.createElement('th');
+    th.className = 'colh';
+    th.textContent = colToName(c);
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  grid.appendChild(thead);
+
+  var tbody = document.createElement('tbody');
+  for (var r = 0; r < ROWS; r++) {
+    var tr = document.createElement('tr');
+    var th2 = document.createElement('th');
+    th2.className = 'rowh';
+    th2.textContent = rowToName(r);
+    tr.appendChild(th2);
+    for (var c2 = 0; c2 < COLS; c2++) {
+      var ref = toRef(c2, r);
+      var td = document.createElement('td');
+      td.id = 'c' + ref;
+      td.dataset.ref = ref;
+      td.dataset.col = String(c2);
+      td.dataset.row = String(r);
+      td.className = 'text';
+      var div = document.createElement('div');
+      div.className = 'cell-display';
+      td.appendChild(div);
+      displayDivs[ref] = div;
+      var inp = document.createElement('input');
+      inp.type = 'text';
+      inp.spellcheck = false;
+      inp.autocomplete = 'off';
+      inp.style.display = 'none';
+      td.appendChild(inp);
+      inputs[ref] = inp;
+
+      (function (ref) {
+        td.addEventListener('mousedown', function (e) {
+          e.preventDefault();
+          selectCell(ref, false);
+        });
+        td.addEventListener('dblclick', function (e) {
+          e.preventDefault();
+          selectCell(ref, true);
+        });
+      }(ref));
+
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  grid.appendChild(tbody);
+
+  function selectCell(ref, edit) {
+    // If currently editing, commit first.
+    if (editingRef) commitEdit(false);
+    selectedRef = ref;
+    var p = parseRef(ref);
+    selected = { c: p.c, r: p.r };
+    refreshAll(selectedRef);
+    if (edit) startEdit(ref);
+    else syncFormulaBar();
+    ensureVisible(ref);
+    if (onChange) onChange();
+  }
+
+  function startEdit(ref) {
+    if (editingRef && editingRef === ref) return;
+    if (editingRef) commitEdit(false);
+    editingRef = ref;
+    var td = document.getElementById('c' + ref);
+    td.classList.add('editing');
+    td.classList.add('edit-mode');
+    var inp = inputs[ref];
+    var raw = cells[ref] ? cells[ref].raw : '';
+    inp.value = raw;
+    inp.style.display = 'block';
+    inp.focus();
+    inp.select();
+    if (onChange) onChange();
+  }
+
+  var editingRef = null;
+
+  function syncFormulaBar() {
+    var raw = cells[selectedRef] ? cells[selectedRef].raw : '';
+    formulaInput.value = raw;
+    statusEl.textContent = selectedRef;
+  }
+
+  function refreshAll(selRef) {
+    for (var ref in displayDivs) {
+      if (displayDivs.hasOwnProperty(ref)) {
+        refreshCell(ref, selRef);
+      }
+    }
+    // cellClass uses cells; sync formula bar if not editing
+    if (!editingRef) syncFormulaBar();
+  }
+
+  function ensureVisible(ref) {
+    var td = document.getElementById('c' + ref);
+    if (td && td.scrollIntoView) {
+      td.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+  }
+
+  // ---------- commit ----------
+
+  function commitEdit(direction) {
+    if (!editingRef) {
+      if (direction) moveSel(direction);
+      return;
+    }
+    var ref = editingRef;
+    var inp = inputs[ref];
+    var raw = inp.value;
+    editingRef = null;
+    var td = document.getElementById('c' + ref);
+    td.classList.remove('editing');
+    td.classList.remove('edit-mode');
+    inp.style.display = 'none';
+    setCell(ref, raw);
+    recompute();
+    refreshAll(selectedRef);
+    if (direction) moveSel(direction);
+    if (onChange) onChange();
+  }
+
+  function cancelEdit() {
+    if (!editingRef) return;
+    var ref = editingRef;
+    editingRef = null;
+    var td = document.getElementById('c' + ref);
+    td.classList.remove('editing');
+    td.classList.remove('edit-mode');
+    inputs[ref].style.display = 'none';
+    refreshAll(selectedRef);
+  }
+
+  function moveSel(dir) {
+    var r = selected.r, c = selected.c;
+    if (dir === 'down') { if (r < ROWS - 1) selectCell(toRef(c, r + 1), false); }
+    else if (dir === 'right') { if (c < COLS - 1) selectCell(toRef(c + 1, r), false); }
+    else selectCell(toRef(c, r), false);
+  }
+
+  function moveUp() {
+    if (selected.r > 0) selectCell(toRef(selected.c, selected.r - 1), false);
+  }
+  function moveDown() {
+    if (selected.r < ROWS - 1) selectCell(toRef(selected.c, selected.r + 1), false);
+  }
+  function moveLeft() {
+    if (selected.c > 0) selectCell(toRef(selected.c - 1, selected.r), false);
+  }
+  function moveRight() {
+    if (selected.c < COLS - 1) selectCell(toRef(selected.c + 1, selected.r), false);
+  }
+
+  // ---------- keyboard ----------
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'F2') {
+      if (!editingRef) { e.preventDefault(); startEdit(selectedRef); }
+      return;
+    }
+    if (editingRef) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commitEdit('down');
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        commitEdit('right');
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelEdit();
+      }
+      return;
+    }
+    if (e.key === 'ArrowUp') { e.preventDefault(); moveUp(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); moveDown(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); moveLeft(); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); moveRight(); }
+    else if (e.key === 'Enter') { e.preventDefault(); startEdit(selectedRef); }
+    else if (e.key === 'Tab') {
+      e.preventDefault();
+      // Tab moves right when not editing
+      moveRight();
+    }
+    else if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault();
+      setCell(selectedRef, '');
+      recompute();
+      refreshAll(selectedRef);
+      if (onChange) onChange();
+    }
+    else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // printable: start editing with this char
+      e.preventDefault();
+      startEditWith(selectedRef, e.key);
+    }
+  });
+
+  function startEditWith(ref, ch) {
+    if (editingRef) commitEdit(false);
+    editingRef = ref;
+    var td = document.getElementById('c' + ref);
+    td.classList.add('editing');
+    td.classList.add('edit-mode');
+    var inp = inputs[ref];
+    inp.value = ch;
+    inp.style.display = 'block';
+    inp.focus();
+    inp.setSelectionRange(1, 1);
+  }
+
+  // ---------- init ----------
+
+  function init() {
+    // seed some sample content
+    setCell('A1', '10');
+    setCell('B1', '20');
+    setCell('C1', '=SUM(A1:B1)');
+    recompute();
+    refreshAll(selectedRef);
+  }
+
+  init();
+
+  // expose for tests
+  window.__spreadsheet = {
+    setCell: setCell,
+    recompute: recompute,
+    refreshAll: refreshAll,
+    getRaw: function (ref) { return cells[ref] ? cells[ref].raw : ''; },
+    getValue: function (ref) { return cells[ref] ? cells[ref].value : ''; },
+    valueToText: valueToText,
+    cells: cells,
+    selectCell: selectCell,
+    selectedRef: function () { return selectedRef; }
+  };
+})();
+</script>
+</body>
+</html>

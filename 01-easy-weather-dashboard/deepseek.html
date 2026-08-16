@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weather Dashboard</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --card-2: #27364d;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --error: #f87171;
+    --border: #334155;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: linear-gradient(160deg, #0b1220 0%, #1e3a5f 60%, #134e4a 100%);
+    background-attachment: fixed;
+    color: var(--text);
+    min-height: 100vh;
+    padding: 16px;
+  }
+  .container { max-width: 720px; margin: 0 auto; }
+
+  h1.title {
+    text-align: center;
+    margin: 8px 0 20px;
+    font-size: 1.6rem;
+    letter-spacing: 0.5px;
+  }
+  h1.title span { color: var(--accent); }
+
+  .search-box {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  .search-box input {
+    flex: 1;
+    padding: 14px 16px;
+    font-size: 1rem;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--text);
+    outline: none;
+  }
+  .search-box input:focus { border-color: var(--accent); }
+  .search-box button {
+    padding: 0 22px;
+    font-size: 1rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 12px;
+    background: var(--accent);
+    color: #082f49;
+    cursor: pointer;
+  }
+  .search-box button:hover { background: #7dd3fc; }
+
+  #message {
+    display: none;
+    padding: 14px 16px;
+    border-radius: 12px;
+    margin-bottom: 16px;
+    font-weight: 500;
+  }
+  #message.error { background: rgba(248,113,113,0.15); color: var(--error); border: 1px solid var(--error); }
+  #message.loading { background: rgba(56,189,248,0.12); color: var(--accent); border: 1px solid var(--accent); }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+  .card h2 { margin: 0 0 14px; font-size: 1.05rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+
+  .current {
+    display: none;
+    text-align: center;
+  }
+  .city { font-size: 1.4rem; font-weight: 700; margin: 0 0 4px; }
+  .region { color: var(--muted); margin: 0 0 16px; font-size: 0.9rem; }
+  .conditions { display: flex; align-items: center; justify-content: center; gap: 18px; }
+  .icon { font-size: 4.5rem; line-height: 1; }
+  .temp { font-size: 4rem; font-weight: 700; line-height: 1; }
+  .condition-text { color: var(--muted); margin-top: 6px; }
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-top: 20px;
+  }
+  .metric { background: var(--card-2); border-radius: 12px; padding: 12px 8px; }
+  .metric .label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; }
+  .metric .value { font-size: 1.2rem; font-weight: 600; margin-top: 4px; }
+
+  .forecast { display: none; }
+  .forecast-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; }
+  .day {
+    flex: 0 0 auto;
+    width: 88px;
+    background: var(--card-2);
+    border-radius: 12px;
+    padding: 12px 6px;
+    text-align: center;
+  }
+  .day .day-name { font-size: 0.85rem; color: var(--muted); font-weight: 600; }
+  .day .d-icon { font-size: 1.8rem; margin: 8px 0 4px; }
+  .day .d-high { font-weight: 700; font-size: 1.05rem; }
+  .day .d-low { color: var(--muted); font-size: 0.9rem; }
+  .day .d-cond { font-size: 0.72rem; color: var(--muted); margin-top: 6px; min-height: 26px; }
+
+  .chart { display: none; }
+  canvas { width: 100%; height: 220px; display: block; }
+  .chart-scroll { overflow-x: auto; }
+  canvas.chart-inner { min-width: 520px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1 class="title">Weather<span>Dash</span></h1>
+
+  <div class="search-box">
+    <input id="city-input" type="text" placeholder="Enter city name…" autocomplete="off">
+    <button id="search-btn">Search</button>
+  </div>
+
+  <div id="message"></div>
+
+  <div class="card current" id="current-card">
+    <p class="city" id="city-name"></p>
+    <p class="region" id="city-region"></p>
+    <div class="conditions">
+      <div class="icon" id="current-icon"></div>
+      <div class="temp" id="current-temp"></div>
+    </div>
+    <div class="condition-text" id="current-cond"></div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">Feels like</div>
+        <div class="value" id="m-feels"></div>
+      </div>
+      <div class="metric">
+        <div class="label">Wind</div>
+        <div class="value" id="m-wind"></div>
+      </div>
+      <div class="metric">
+        <div class="label">Humidity</div>
+        <div class="value" id="m-humidity"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card forecast" id="forecast-card">
+    <h2>7-Day Forecast</h2>
+    <div class="forecast-row" id="forecast-row"></div>
+  </div>
+
+  <div class="card chart" id="chart-card">
+    <h2>Next 24 Hours</h2>
+    <div class="chart-scroll">
+      <canvas id="chart" class="chart-inner"></canvas>
+    </div>
+  </div>
+
+  <footer>Data by Open-Meteo.com</footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var GEO_URL = "https://geocoding-api.open-meteo.com/v1/search";
+  var FORECAST_URL = "https://api.open-meteo.com/v1/forecast";
+
+  var input = document.getElementById("city-input");
+  var searchBtn = document.getElementById("search-btn");
+  var messageEl = document.getElementById("message");
+  var currentCard = document.getElementById("current-card");
+  var forecastCard = document.getElementById("forecast-card");
+  var chartCard = document.getElementById("chart-card");
+
+  var WMO = {
+    0: { sym: "\u2600", label: "Clear sky" },
+    1: { sym: "\u2600", label: "Mainly clear" },
+    2: { sym: "\u2601\uFE0F", label: "Partly cloudy" },
+    3: { sym: "\u2601\uFE0F", label: "Overcast" },
+    45: { sym: "\U0001F32B\uFE0F", label: "Fog" },
+    48: { sym: "\U0001F32B\uFE0F", label: "Rime fog" },
+    51: { sym: "\U0001F4A7", label: "Light drizzle" },
+    53: { sym: "\U0001F4A7", label: "Drizzle" },
+    55: { sym: "\U0001F4A7", label: "Heavy drizzle" },
+    56: { sym: "\U0001F4A7", label: "Freezing drizzle" },
+    57: { sym: "\U0001F4A7", label: "Freezing drizzle" },
+    61: { sym: "\U0001F326\uFE0F", label: "Light rain" },
+    63: { sym: "\U0001F326\uFE0F", label: "Rain" },
+    65: { sym: "\U0001F326\uFE0F", label: "Heavy rain" },
+    66: { sym: "\U0001F326\uFE0F", label: "Freezing rain" },
+    67: { sym: "\U0001F326\uFE0F", label: "Freezing rain" },
+    71: { sym: "\U0001F328\uFE0F", label: "Light snow" },
+    73: { sym: "\U0001F328\uFE0F", label: "Snow" },
+    75: { sym: "\U0001F328\uFE0F", label: "Heavy snow" },
+    77: { sym: "\U0001F328\uFE0F", label: "Snow grains" },
+    80: { sym: "\U0001F327\uFE0F", label: "Light showers" },
+    81: { sym: "\U0001F327\uFE0F", label: "Showers" },
+    82: { sym: "\U0001F327\uFE0F", label: "Violent showers" },
+    85: { sym: "\U0001F328\uFE0F", label: "Snow showers" },
+    86: { sym: "\U0001F328\uFE0F", label: "Snow showers" },
+    95: { sym: "\u26C8\uFE0F", label: "Thunderstorm" },
+    96: { sym: "\u26C8\uFE0F", label: "Thunderstorm w/ hail" },
+    99: { sym: "\u26C8\uFE0F", label: "Thunderstorm w/ hail" }
+  };
+
+  function wmoInfo(code) {
+    return WMO[code] || { sym: "\u2753", label: "Unknown" };
+  }
+
+  function showMessage(text, type) {
+    messageEl.style.display = "block";
+    messageEl.className = type || "";
+    messageEl.textContent = text;
+  }
+
+  function clearMessage() {
+    messageEl.style.display = "none";
+    messageEl.textContent = "";
+  }
+
+  function hideResults() {
+    currentCard.style.display = "none";
+    forecastCard.style.display = "none";
+    chartCard.style.display = "none";
+  }
+
+  function search() {
+    var query = input.value.trim();
+    if (!query) {
+      showMessage("Please enter a city name.", "error");
+      return;
+    }
+    hideResults();
+    showMessage("Searching for \u201C" + query + "\u201D\u2026", "loading");
+
+    var geoUrl = GEO_URL + "?name=" + encodeURIComponent(query) +
+      "&count=1&language=en&format=json";
+
+    fetch(geoUrl)
+      .then(function (res) {
+        if (!res.ok) throw new Error("network");
+        return res.json();
+      })
+      .then(function (data) {
+        var result = data && data.results && data.results[0];
+        if (!result) {
+          showMessage("City not found. Please check the spelling and try again.", "error");
+          return;
+        }
+        clearMessage();
+        loadWeather(result);
+      })
+      .catch(function () {
+        showMessage("Network error. Could not reach the weather service. Please try again.", "error");
+      });
+  }
+
+  function loadWeather(loc) {
+    var name = loc.name || "Unknown";
+    var region = [loc.admin1, loc.country].filter(Boolean).join(", ");
+    document.getElementById("city-name").textContent = name;
+    document.getElementById("city-region").textContent = region || "";
+
+    var fUrl = FORECAST_URL +
+      "?latitude=" + loc.latitude +
+      "&longitude=" + loc.longitude +
+      "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m" +
+      "&hourly=temperature_2m,weather_code" +
+      "&daily=weather_code,temperature_2m_max,temperature_2m_min" +
+      "&forecast_days=7" +
+      "&temperature_unit=celsius" +
+      "&wind_speed_unit=kmh" +
+      "&timezone=auto";
+
+    fetch(fUrl)
+      .then(function (res) {
+        if (!res.ok) throw new Error("network");
+        return res.json();
+      })
+      .then(function (data) {
+        renderCurrent(data);
+        renderForecast(data);
+        renderChart(data);
+        currentCard.style.display = "block";
+        forecastCard.style.display = "block";
+        chartCard.style.display = "block";
+      })
+      .catch(function () {
+        showMessage("Network error while loading weather data. Please try again.", "error");
+      });
+  }
+
+  function renderCurrent(data) {
+    var c = data.current;
+    var info = wmoInfo(c.weather_code);
+    document.getElementById("current-icon").textContent = info.sym;
+    document.getElementById("current-temp").textContent = Math.round(c.temperature_2m) + "\u00B0";
+    document.getElementById("current-cond").textContent = info.label;
+    document.getElementById("m-feels").textContent = Math.round(c.apparent_temperature) + "\u00B0";
+    document.getElementById("m-wind").textContent = Math.round(c.wind_speed_10m) + " km/h";
+    document.getElementById("m-humidity").textContent = c.relative_humidity_2m + "%";
+  }
+
+  function renderForecast(data) {
+    var row = document.getElementById("forecast-row");
+    row.innerHTML = "";
+    var days = data.daily.time.length;
+
+    for (var i = 0; i < days; i++) {
+      var info = wmoInfo(data.daily.weather_code[i]);
+      var dayName = formatDay(data.daily.time[i], i);
+      var div = document.createElement("div");
+      div.className = "day";
+      div.innerHTML =
+        '<div class="day-name">' + dayName + "</div>" +
+        '<div class="d-icon">' + info.sym + "</div>" +
+        '<div class="d-high">' + Math.round(data.daily.temperature_2m_max[i]) + "\u00B0</div>" +
+        '<div class="d-low">' + Math.round(data.daily.temperature_2m_min[i]) + "\u00B0</div>" +
+        '<div class="d-cond">' + info.label + "</div>";
+      row.appendChild(div);
+    }
+  }
+
+  function formatDay(dateStr, index) {
+    if (index === 0) return "Today";
+    var d = new Date(dateStr + "T12:00:00");
+    return d.toLocaleDateString(undefined, { weekday: "short" });
+  }
+
+  function renderChart(data) {
+    var canvas = document.getElementById("chart");
+    var dpr = window.devicePixelRatio || 1;
+    var width = 520;
+    var height = 220;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    canvas.style.width = width + "px";
+    canvas.style.height = height + "px";
+
+    var ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var temps = data.hourly.temperature_2m;
+    var times = data.hourly.time;
+    var count = Math.min(temps.length, 24);
+
+    var padding = { top: 25, right: 30, bottom: 40, left: 40 };
+    var plotW = width - padding.left - padding.right;
+    var plotH = height - padding.top - padding.bottom;
+
+    var minT = Infinity, maxT = -Infinity;
+    for (var i = 0; i < count; i++) {
+      if (temps[i] < minT) minT = temps[i];
+      if (temps[i] > maxT) maxT = temps[i];
+    }
+    if (minT === maxT) { minT -= 2; maxT += 2; }
+    var range = maxT - minT;
+    minT -= range * 0.1;
+    maxT += range * 0.1;
+
+    function x(i) { return padding.left + (i / (count - 1)) * plotW; }
+    function y(t) {
+      return padding.top + ((maxT - t) / (maxT - minT)) * plotH;
+    }
+
+    // Background
+    ctx.fillStyle = "#0f172a";
+    ctx.fillRect(0, 0, width, height);
+
+    // Grid lines + Y labels
+    ctx.strokeStyle = "#334155";
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "11px sans-serif";
+    ctx.textAlign = "right";
+    ctx.lineWidth = 1;
+    var gridSteps = 5;
+    for (var g = 0; g <= gridSteps; g++) {
+      var tVal = maxT - (g / gridSteps) * (maxT - minT);
+      var yy = y(tVal);
+      ctx.beginPath();
+      ctx.moveTo(padding.left, yy);
+      ctx.lineTo(width - padding.right, yy);
+      ctx.stroke();
+      ctx.fillText(Math.round(tVal) + "\u00B0", padding.left - 6, yy + 4);
+    }
+
+    // X labels (every 3 hours)
+    ctx.textAlign = "center";
+    for (var h = 0; h < count; h++) {
+      if (h % 3 === 0) {
+        var label = formatHour(times[h]);
+        ctx.fillText(label, x(h), height - padding.bottom + 18);
+      }
+    }
+
+    // Area fill
+    ctx.beginPath();
+    ctx.moveTo(x(0), y(temps[0]));
+    for (var a = 1; a < count; a++) ctx.lineTo(x(a), y(temps[a]));
+    ctx.lineTo(x(count - 1), height - padding.bottom);
+    ctx.lineTo(x(0), height - padding.bottom);
+    ctx.closePath();
+    var grad = ctx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+    grad.addColorStop(0, "rgba(56,189,248,0.5)");
+    grad.addColorStop(1, "rgba(56,189,248,0.05)");
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    ctx.moveTo(x(0), y(temps[0]));
+    for (var l = 1; l < count; l++) ctx.lineTo(x(l), y(temps[l]));
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = "round";
+    ctx.stroke();
+
+    // Points
+    ctx.fillStyle = "#38bdf8";
+    for (var p = 0; p < count; p++) {
+      ctx.beginPath();
+      ctx.arc(x(p), y(temps[p]), 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function formatHour(timeStr) {
+    var d = new Date(timeStr);
+    return d.toLocaleTimeString(undefined, { hour: "numeric", hour12: false }) + "h";
+  }
+
+  searchBtn.addEventListener("click", search);
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") search();
+  });
+})();
+</script>
+</body>
+</html>

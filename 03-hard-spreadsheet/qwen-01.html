@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spreadsheet</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 8px; background: #f5f5f5; }
+  h1 { font-size: 16px; margin: 4px 0 8px 0; }
+  #bar { display: flex; align-items: center; margin-bottom: 6px; gap: 6px; }
+  #ref { font-weight: bold; width: 44px; text-align: center; background: #ececec; border: 1px solid #bbb; border-radius: 3px; padding: 4px; }
+  #funct { color: #555; width: 24px; text-align: center; font-family: serif; font-style: italic; }
+  #formula { flex: 1; padding: 4px 6px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; border: 1px solid #bbb; border-radius: 3px; background: #fff; }
+  #gridwrap { display: inline-block; }
+  #grid { border-collapse: collapse; background: #fff; border: 1px solid #999; }
+  th, td { border: 1px solid #ccc; min-width: 64px; height: 22px; padding: 2px 5px; font-size: 13px; text-align: left; }
+  th { background: #e8e8e8; text-align: center; font-weight: 600; cursor: default; }
+  td { cursor: cell; user-select: none; }
+  td.num { text-align: right; }
+  td.err { color: #c0392b; }
+  td.sel { outline: 2px solid #1a56db; outline-offset: -2px; position: relative; z-index: 1; }
+  #edit { display: none; }
+  #hint { color: #777; font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>Spreadsheet</h1>
+<div id="bar">
+  <span id="ref">-</span>
+  <span id="funct">fx</span>
+  <input id="formula" type="text">
+</div>
+<div id="gridwrap">
+  <table id="grid"></table>
+</div>
+<input id="edit" type="text" autocomplete="off" spellcheck="false">
+<div id="hint">Click a cell, type to edit. Enter: commit + move down. Tab: commit + move right. Arrows: move selection. Esc: cancel edit.</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Constants ----------
+  var ROWS = 20, COLS = 10, COLS_LETTERS = 'ABCDEFGHIJ';
+
+  // ---------- State ----------
+  // raw[r][c]  : stored string content (may be "", number-string, or "=...")
+  // val[r][c]  : computed value: number | string | Error
+  // dependents[r][c] : Set of "r,c" keys that reference this cell
+  var raw = [], val = [], dependents = [];
+  for (var r = 0; r < ROWS; r++) {
+    raw.push(new Array(COLS).fill(''));
+    val.push(new Array(COLS).fill(''));
+    dependents.push(new Array(COLS));
+    for (var c = 0; c < COLS; c++) dependents[r][c] = new Set();
+  }
+
+  var selected = { r: 0, c: 0 };
+  var editing = false;
+
+  // ---------- DOM ----------
+  var gridEl = document.getElementById('grid');
+  var refEl = document.getElementById('ref');
+  var formulaEl = document.getElementById('formula');
+  var editEl = document.getElementById('edit');
+  var cellEls = [];
+
+  function buildGrid() {
+    var html = '<tr><th></th>';
+    for (var c = 0; c < COLS; c++) html += '<th>' + COLS_LETTERS[c] + '</th>';
+    html += '</tr>';
+    for (var r = 0; r < ROWS; r++) {
+      html += '<tr><th>' + (r + 1) + '</th>';
+      for (var c2 = 0; c2 < COLS; c2++) html += '<td></td>';
+      html += '</tr>';
+    }
+    gridEl.innerHTML = html;
+    var tds = gridEl.querySelectorAll('td');
+    cellEls = new Array(ROWS * COLS);
+    var i = 0;
+    for (var r2 = 0; r2 < ROWS; r2++) {
+      for (var c3 = 0; c3 < COLS; c3++) cellEls[r2 * COLS + c3] = tds[i++];
+    }
+  }
+  buildGrid();
+
+  function cellKey(r, c) { return COLS_LETTERS[c] + (r + 1); }
+
+  // ---------- Tokenizer ----------
+  function tokenize(s) {
+    var toks = [], i = 0;
+    while (i < s.length) {
+      var ch = s[i];
+      if (ch === ' ' || ch === '\t') { i++; continue; }
+      if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(s[i + 1] || ''))) {
+        var j = i, seenDot = false;
+        while (j < s.length && (/[0-9]/.test(s[j]) || (s[j] === '.' && !seenDot))) {
+          if (s[j] === '.') seenDot = true;
+          j++;
+        }
+        toks.push({ t: 'num', v: parseFloat(s.slice(i, j)) });
+        i = j; continue;
+      }
+      if (/[A-Za-z]/.test(ch)) {
+        var j2 = i;
+        while (j2 < s.length && /[A-Za-z0-9_]/.test(s[j2])) j2++;
+        toks.push({ t: 'name', v: s.slice(i, j2).toUpperCase() });
+        i = j2; continue;
+      }
+      if ('+-*/%(),:'.indexOf(ch) !== -1) { toks.push({ t: ch, v: ch }); i++; continue; }
+      throw new SyntaxError('bad char ' + ch);
+    }
+    return toks;
+  }
+
+  // ---------- Parser (recursive descent) ----------
+  // Grammar:
+  //   expr    := term (('+'|'-') term)*
+  //   term    := factor (('*'|'/'|'%') factor)*
+  //   factor  := '-' factor | '+' factor | primary
+  //   primary := number | name '(' arglist? ')' | name | cellref
+  function parseExpr(toks) {
+    var pos = 0;
+    function peek() { return toks[pos]; }
+    function next() { return toks[pos++]; }
+    function expect(t) { var tok = next(); if (!tok || tok.t !== t) throw new SyntaxError('expected ' + t); return tok; }
+
+    function parseExpression() {
+      var node = parseTerm();
+      while (peek() && (peek().t === '+' || peek().t === '-')) {
+        var op = next().t;
+        node = { kind: 'bin', op: op, l: node, r: parseTerm() };
+      }
+      return node;
+    }
+
+    function parseTerm() {
+      var node = parseUnary();
+      while (peek() && (peek().t === '*' || peek().t === '/' || peek().t === '%')) {
+        var op = next().t;
+        node = { kind: 'bin', op: op, l: node, r: parseUnary() };
+      }
+      return node;
+    }
+
+    function parseUnary() {
+      if (peek() && (peek().t === '-' || peek().t === '+')) {
+        var op = next().t;
+        return { kind: op === '-' ? 'neg' : 'pos', a: parseUnary() };
+      }
+      return parsePrimary();
+    }
+
+    function parseRange() {
+      var a = parsePrimary(); // should produce cellref
+      if (peek() && peek().t === ':') {
+        next();
+        var b = parsePrimary();
+        if (a.kind === 'cell' && b.kind === 'cell') {
+          return { kind: 'range', from: a.ref, to: b.ref };
+        }
+        throw new SyntaxError('bad range');
+      }
+      return a;
+    }
+
+    function parsePrimary() {
+      var tok = peek();
+      if (!tok) throw new SyntaxError('unexpected end');
+      if (tok.t === 'num') { next(); return { kind: 'num', v: tok.v }; }
+      if (tok.t === '(') {
+        next();
+        var node = parseExpression();
+        expect(')');
+        return node;
+      }
+      if (tok.t === 'name') {
+        next();
+        if (peek() && peek().t === '(') {
+          next();
+          var args = [];
+          if (!(peek() && peek().t === ')')) {
+            args.push(parseRange());
+            while (peek() && peek().t === ',') { next(); args.push(parseRange()); }
+          }
+          expect(')');
+          return { kind: 'call', name: tok.v, args: args };
+        }
+        var ref = refFromName(tok.v);
+        if (ref) return { kind: 'cell', ref: ref };
+        throw new SyntaxError('unknown name ' + tok.v);
+      }
+      throw new SyntaxError('unexpected token ' + tok.t);
+    }
+
+    var result = parseExpression();
+    if (pos !== toks.length) throw new SyntaxError('trailing tokens');
+    return result;
+  }
+
+  function refFromName(name) {
+    var m = /^([A-J])([1-9][0-9]?)$/.exec(name);
+    if (!m) return null;
+    var c = COLS_LETTERS.indexOf(m[1]), rowNum = parseInt(m[2], 10);
+    if (c < 0 || rowNum < 1 || rowNum > ROWS) return null;
+    return { r: rowNum - 1, c: c };
+  }
+
+  function rangeCells(a, b) {
+    var r1 = Math.min(a.r, b.r), r2 = Math.max(a.r, b.r);
+    var c1 = Math.min(a.c, b.c), c2 = Math.max(a.c, b.c);
+    var out = [];
+    for (var r = r1; r <= r2; r++) for (var c = c1; c <= c2; c++) out.push({ r: r, c: c });
+    return out;
+  }
+
+  // ---------- Errors ----------
+  function E(msg) { var e = new Error(msg); e.isExcel = true; return e; }
+
+  var CIRCULAR = 'CIRCULAR';
+
+  // ---------- Evaluator ----------
+  function makeEvaluator(stack) {
+    return function evaluate(ref) {
+      var r = ref.r, c = ref.c;
+      var content = raw[r][c];
+      if (content === '' ) return '';
+      if (content.charAt(0) !== '=') {
+        var n = Number(content);
+        return (content !== '' && !isNaN(n)) ? n : content;
+      }
+      var key = r + ',' + c;
+      if (stack.indexOf(key) !== -1) {
+        throw E(CIRCULAR + ':' + key);
+      }
+      stack.push(key);
+      try {
+        var ast;
+        try {
+          var toks = tokenize(content.slice(1));
+          if (toks.length === 0) throw new SyntaxError('empty');
+          ast = parseExpr(toks);
+        } catch (e) {
+          throw E('INVALID FORMULA');
+        }
+        return evalNode(ast, makeEvaluator(stack));
+      } finally {
+        stack.pop();
+      }
+    };
+  }
+
+  function asNumber(v) {
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') {
+      if (v === '') return 0;
+      var n = Number(v);
+      if (isNaN(n)) throw E('VALUE');
+      return n;
+    }
+    throw v; // rethrow excel error
+  }
+
+  function evalNode(node, ev) {
+    switch (node.kind) {
+      case 'num': return node.v;
+      case 'cell': {
+        var v = ev(node.ref);
+        if (v === '') return 0;
+        return v;
+      }
+      case 'range':
+        return rangeCells(node.from, node.to).map(ev);
+      case 'neg': return -asNumber(evalNode(node.a, ev));
+      case 'pos': return +asNumber(evalNode(node.a, ev));
+      case 'bin': {
+        var l = asNumber(evalNode(node.l, ev));
+        var rr = asNumber(evalNode(node.r, ev));
+        switch (node.op) {
+          case '+': return l + rr;
+          case '-': return l - rr;
+          case '*': return l * rr;
+          case '%':
+            if (rr === 0) throw E('DIV/0');
+            return l % rr;
+          case '/':
+            if (rr === 0) throw E('DIV/0');
+            var q = l / rr;
+            if (!isFinite(q)) throw E('DIV/0');
+            return q;
+        }
+        throw E('UNKNOWN OP');
+      }
+      case 'call': {
+        var vals = node.args.map(function (a) {
+          var v = evalNode(a, ev);
+          return Array.isArray(v) ? v : [v];
+        });
+        return applyFunc(node.name, vals);
+      }
+    }
+    throw E('BAD NODE');
+  }
+
+  function collectNums(lists) {
+    var out = [];
+    for (var i = 0; i < lists.length; i++) {
+      for (var j = 0; j < lists[i].length; j++) {
+        var v = lists[i][j];
+        if (v instanceof Error) throw v;
+        if (typeof v === 'number') out.push(v);
+        else if (typeof v === 'string') {
+          if (v === '') continue;
+          var n = Number(v);
+          if (!isNaN(n)) out.push(n);
+        }
+      }
+    }
+    return out;
+  }
+
+  function applyFunc(name, lists) {
+    function single(v) {
+      if (v.length !== 1) throw E('BAD ARGS');
+      return asNumber(v[0]);
+    }
+    switch (name) {
+      case 'SUM': {
+        var nums = collectNums(lists), s = 0;
+        for (var i = 0; i < nums.length; i++) s += nums[i];
+        return s;
+      }
+      case 'AVERAGE': {
+        var n2 = collectNums(lists);
+        if (n2.length === 0) throw E('DIV/0');
+        var s2 = 0;
+        for (var i2 = 0; i2 < n2.length; i2++) s2 += n2[i2];
+        return s2 / n2.length;
+      }
+      case 'MIN': {
+        var n3 = collectNums(lists);
+        if (n3.length === 0) throw E('EMPTY');
+        return Math.min.apply(null, n3);
+      }
+      case 'MAX': {
+        var n4 = collectNums(lists);
+        if (n4.length === 0) throw E('EMPTY');
+        return Math.max.apply(null, n4);
+      }
+      case 'COUNT': {
+        return collectNums(lists).length;
+      }
+      case 'ABS': return Math.abs(single(lists));
+      default: throw E('UNKNOWN FUNC ' + name);
+    }
+  }
+
+  function valueToString(v) {
+    if (v instanceof Error) {
+      if (v.message.indexOf('CIRCULAR') === 0) return '#CIRCULAR!';
+      if (v.message === 'DIV/0') return '#DIV/0!';
+      return '#ERROR!';
+    }
+    if (typeof v === 'number') {
+      if (!isFinite(v)) return '#ERROR!';
+      var s = String(Math.round(v * 1e10) / 1e10);
+      return s;
+    }
+    return v;
+  }
+
+  function isError(v) { return v instanceof Error; }
+
+  // ---------- Dependency graph / recalculation ----------
+  function recomputeRefs(content, baseR, baseC, out) {
+    if (content.charAt(0) !== '=') return;
+    try {
+      var toks = tokenize(content.slice(1));
+      var ast = parseExpr(toks);
+      walkRefs(ast, out);
+    } catch (e) { /* invalid formula: no refs */ }
+  }
+
+  function walkRefs(node, out) {
+    switch (node.kind) {
+      case 'cell': out.add(node.ref.r + ',' + node.ref.c); break;
+      case 'range':
+        rangeCells(node.from, node.to).forEach(function (rc) { out.add(rc.r + ',' + rc.c); });
+        break;
+      case 'bin': walkRefs(node.l, out); walkRefs(node.r, out); break;
+      case 'neg': case 'pos': walkRefs(node.a, out); break;
+      case 'call': node.args.forEach(function (a) { walkRefs(a, out); }); break;
+    }
+  }
+
+  // Full dependency graph (cell -> set of cells it depends on)
+  var depGraph = [];
+  for (var rq = 0; rq < ROWS; rq++) {
+    depGraph.push(new Array(COLS));
+    for (var cq = 0; cq < COLS; cq++) depGraph[rq][cq] = new Set();
+  }
+
+  function updateGraphFor(r, c) {
+    depGraph[r][c] = new Set();
+    recomputeRefs(raw[r][c], r, c, depGraph[r][c]);
+  }
+
+  function rebuildDependents() {
+    for (var r = 0; r < ROWS; r++) for (var c = 0; c < COLS; c++) dependents[r][c] = new Set();
+    for (var r2 = 0; r2 < ROWS; r2++) for (var c2 = 0; c2 < COLS; c2++) {
+      depGraph[r2][c2].forEach(function (k) {
+        var p = k.split(',');
+        dependents[+p[0]][+p[1]].add(r2 * COLS + c2);
+      });
+    }
+  }
+
+  // Recompute a cell and cascade to dependents via BFS (fixpoint).
+  function recalcChanged(startR, startC) {
+    updateGraphFor(startR, startC);
+    rebuildDependents();
+    var queue = [startR * COLS + startC];
+    var inQueue = { [startR * COLS + startC]: true };
+    // stable iteration: keep processing until queue empty
+    while (queue.length) {
+      var k = queue.shift();
+      inQueue[k] = false;
+      var cr = Math.floor(k / COLS), cc = k % COLS;
+      val[cr][cc] = computeCell(cr, cc);
+      dependents[cr][cc].forEach(function (dk) {
+        if (!inQueue[dk]) { queue.push(dk); inQueue[dk] = true; }
+      });
+    }
+    renderAll();
+  }
+
+  function computeCell(r, c) {
+    try {
+      return makeEvaluator([])({ r: r, c: c });
+    } catch (e) {
+      if (e.isExcel || e instanceof Error) {
+        if (e.message && e.message.indexOf('CIRCULAR') !== -1 && !e.isExcel) {
+          return E(CIRCULAR);
+        }
+        if (e.isExcel) return e;
+      }
+      return E('INVALID FORMULA');
+    }
+  }
+
+  // ---------- Rendering ----------
+  function renderAll() {
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        renderCell(r, c);
+      }
+    }
+  }
+
+  function renderCell(r, c) {
+    var el = cellEls[r * COLS + c];
+    var v = val[r][c];
+    el.textContent = valueToString(v);
+    el.classList.toggle('num', typeof v === 'number' && !isError(v));
+    el.classList.toggle('err', isError(v));
+    updateSelectionUI();
+  }
+
+  function updateSelectionUI() {
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var el = cellEls[r * COLS + c];
+        var sel = (r === selected.r && c === selected.c);
+        el.classList.toggle('sel', sel);
+        if (sel && !editing) {
+          refEl.textContent = cellKey(r, c);
+          formulaEl.value = raw[r][c];
+        }
+      }
+    }
+  }
+
+  function select(r, c) {
+    if (r < 0) r = 0; if (r >= ROWS) r = ROWS - 1;
+    if (c < 0) c = 0; if (c >= COLS) c = COLS - 1;
+    selected.r = r; selected.c = c;
+    updateSelectionUI();
+  }
+
+  // ---------- Editing ----------
+  function startEdit(initial) {
+    if (editing) return;
+    editing = true;
+    var el = cellEls[selected.r * COLS + selected.c];
+    var rect = el.getBoundingClientRect();
+    editEl.style.display = 'block';
+    editEl.style.left = rect.left + 'px';
+    editEl.style.top = rect.top + 'px';
+    editEl.style.width = rect.width + 'px';
+    editEl.style.height = rect.height + 'px';
+    editEl.value = initial;
+    editEl.focus();
+    editEl.select();
+  }
+
+  function commitEdit() {
+    if (!editing) return;
+    editing = false;
+    var text = editEl.value;
+    editEl.style.display = 'none';
+    setText(selected.r, selected.c, text);
+    recalcChanged(selected.r, selected.c);
+  }
+
+  function cancelEdit() {
+    if (!editing) return;
+    editing = false;
+    editEl.style.display = 'none';
+    updateSelectionUI();
+  }
+
+  function setText(r, c, text) {
+    if (raw[r][c] === text) return;
+    raw[r][c] = text;
+  }
+
+  // ---------- Events ----------
+  gridEl.addEventListener('mousedown', function (e) {
+    var td = e.target.closest('td');
+    if (!td) return;
+    e.preventDefault();
+    if (editing) commitEdit();
+    var r = Math.floor(td.rowIndex - 1), c = td.cellIndex - 1;
+    select(r, c);
+  });
+
+  gridEl.addEventListener('dblclick', function (e) {
+    var td = e.target.closest('td');
+    if (!td) return;
+    e.preventDefault();
+    var r = Math.floor(td.rowIndex - 1), c = td.cellIndex - 1;
+    select(r, c);
+    startEdit(raw[r][c]);
+  });
+
+  function onKeyDown(e) {
+    if (editing) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commitEdit();
+        select(selected.r + 1, selected.c);
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        commitEdit();
+        select(selected.r, selected.c + 1);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelEdit();
+      }
+      return;
+    }
+
+    var key = e.key;
+    if (key.indexOf('Arrow') === 0) {
+      e.preventDefault();
+      if (key === 'ArrowUp') select(selected.r - 1, selected.c);
+      else if (key === 'ArrowDown') select(selected.r + 1, selected.c);
+      else if (key === 'ArrowLeft') select(selected.r, selected.c - 1);
+      else if (key === 'ArrowRight') select(selected.r, selected.c + 1);
+      return;
+    }
+    if (key === 'Tab') {
+      e.preventDefault();
+      startEdit(null);
+      return;
+    }
+    if (key === 'Enter' || key === 'F2') {
+      e.preventDefault();
+      startEdit(null);
+      return;
+    }
+    if (key === 'Delete' || key === 'Backspace') {
+      e.preventDefault();
+      var r = selected.r, c = selected.c;
+      setText(r, c, '');
+      commitCellChange(r, c);
+      return;
+    }
+    // printable char -> start editing with it
+    if (key.length === 1 && (key >= '0' && key <= '9' || 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ=+-*/%(),:.!@#$%^&"\'[]{}<>;_\\|~ `?\\'.indexOf(key) !== -1)) {
+      e.preventDefault();
+      var el = cellEls[selected.r * COLS + selected.c];
+      var rect = el.getBoundingClientRect();
+      startEdit(key);
+      return;
+    }
+  }
+
+  function commitCellChange(r, c) {
+    recalcChanged(r, c);
+  }
+
+  document.addEventListener('keydown', onKeyDown);
+
+  editEl.addEventListener('blur', function () {
+    if (editing) cancelEdit();
+  });
+
+  // Formula bar: click to focus handled simply; typing there edits selected cell.
+  formulaEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      setText(selected.r, selected.c, formulaEl.value);
+      recalcChanged(selected.r, selected.c);
+      select(selected.r + 1, selected.c);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      formulaEl.value = raw[selected.r][selected.c];
+      formulaEl.blur();
+    }
+  });
+
+  // ---------- Init with demo data ----------
+  raw[0][0] = '10';
+  raw[0][1] = '20';
+  raw[1][0] = '=A1*2';          // depends on A1
+  raw[1][1] = '=B1+B2';         // ... (B2 depends on B1? no)
+  raw[2][0] = '=B1+A2';         // chain: depends on A2 -> A1
+  raw[0][2] = '=SUM(A1:B1)';
+  raw[1][2] = '=AVERAGE(A1:B1)';
+  raw[2][2] = '=SUM(A1:B2)*2+A1';
+  raw[0][3] = '=/ 0';
+  raw[1][3] = '=1/0';
+  raw[2][3] = '=B4';
+  raw[3][3] = '=C4';
+  raw[3][0] = 'plain text';
+  raw[3][1] = '=MAX(A1:B2)';
+  raw[3][2] = '=COUNT(A1:B2)';
+
+  for (var r0 = 0; r0 < ROWS; r0++)
+    for (var c0 = 0; c0 < COLS; c0++) {
+      updateGraphFor(r0, c0);
+      val[r0][c0] = computeCell(r0, c0);
+    }
+  rebuildDependents();
+  renderAll();
+  select(0, 0);
+})();
+</script>
+</body>
+</html>

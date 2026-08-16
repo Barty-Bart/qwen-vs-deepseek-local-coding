@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spreadsheet</title>
+<style>
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #f5f6f8;
+    color: #1c1e21;
+  }
+  #toolbar {
+    padding: 8px 12px;
+    background: #ffffff;
+    border-bottom: 1px solid #d0d3d8;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  #namebox {
+    min-width: 60px;
+    padding: 4px 8px;
+    border: 1px solid #c3c7cf;
+    border-radius: 4px;
+    font-size: 13px;
+    background: #fff;
+    text-align: center;
+    font-weight: 600;
+    color: #333;
+  }
+  #formula-bar {
+    flex: 1;
+    padding: 4px 8px;
+    border: 1px solid #c3c7cf;
+    border-radius: 4px;
+    font-size: 14px;
+    font-family: monospace;
+  }
+  #gridwrap {
+    overflow: auto;
+    height: calc(100vh - 52px);
+    padding: 8px;
+  }
+  table {
+    border-collapse: collapse;
+    background: #fff;
+  }
+  td, th {
+    border: 1px solid #d0d3d8;
+    min-width: 90px;
+    height: 26px;
+    padding: 0;
+    text-align: right;
+    font-size: 13px;
+    position: relative;
+  }
+  th.corner {
+    background: #eceef1;
+    min-width: 38px;
+    position: sticky;
+    top: 0;
+    left: 0;
+    z-index: 3;
+  }
+  th.colhead {
+    background: #eceef1;
+    font-weight: 600;
+    text-align: center;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    min-width: 90px;
+  }
+  th.rowhead {
+    background: #eceef1;
+    font-weight: 600;
+    text-align: center;
+    min-width: 38px;
+    width: 38px;
+    position: sticky;
+    left: 0;
+    z-index: 1;
+  }
+  td.selected {
+    outline: 2px solid #1a73e8;
+    outline-offset: -2px;
+    box-shadow: inset 0 0 0 2px #1a73e8;
+    z-index: 5;
+  }
+  td.error { color: #d93025; }
+  td.error-string { color: #d93025; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <input id="namebox" readonly value="">
+  <input id="formula-bar" spellcheck="false" placeholder="fx">
+</div>
+<div id="gridwrap">
+  <table id="grid" cellspacing="0"></table>
+</div>
+<script>
+"use strict";
+
+const ROWS = 20;
+const COLS = 10;
+const COL_LETTERS = "ABCDEFGHIJ";
+
+// Cell model
+const cells = [];           // cells[r][c] = { raw, cached, display, error } or undefined
+const nameToRC = {};        // "A1" -> {r,c}
+const rcToName = {};
+
+for (let c = 0; c < COLS; c++) {
+  for (let r = 0; r < ROWS; r++) {
+    const name = COL_LETTERS[c] + (r + 1);
+    nameToRC[name.toUpperCase()] = { r: r, c: c };
+    rcToName[r + "," + c] = name;
+  }
+}
+
+let selectedR = 0, selectedC = 0;
+let editing = false;
+let formulaFocus = false;
+let editR = 0, editC = 0; // cell currently being edited (committed on blur/Enter)
+
+// ---------- Formula parsing & evaluation ----------
+// Build a tokenizer + recursive descent parser that supports:
+//   numbers, cell refs, functions SUM/AVERAGE/MIN/MAX/COUNT, ranges A1:A10,
+//   + - * / , parentheses. Returns an AST or throws an error.
+
+const FUNCS = { SUM: 1, AVERAGE: 1, MIN: 1, MAX: 1, COUNT: 1 };
+
+function tokenize(input) {
+  const tokens = [];
+  let i = 0;
+  const n = input.length;
+  while (i < n) {
+    const ch = input[i];
+    if (/\s/.test(ch)) { i++; continue; }
+    if (/[0-9]/.test(ch) || (ch === '.' && i + 1 < n && /[0-9]/.test(input[i+1]))) {
+      let j = i;
+      while (j < n && /[0-9.]/.test(input[j])) j++;
+      const str = input.slice(i, j);
+      if (/^[0-9]*\.?[0-9]+$/.test(str)) {
+        tokens.push({ type: 'num', value: parseFloat(str) });
+      } else {
+        throw new Error('bad number');
+      }
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z]/.test(ch)) {
+      let j = i;
+      while (j < n && /[A-Za-z0-9]/.test(input[j])) j++;
+      const word = input.slice(i, j).toUpperCase();
+      if (FUNCS[word]) {
+        tokens.push({ type: 'func', value: word });
+      } else {
+        // could be a cell ref like A1 or range start
+        const m = word.match(/^([A-Z]+)(\d+)$/);
+        if (m) {
+          tokens.push({ type: 'cell', value: word });
+        } else {
+          throw new Error('unknown name');
+        }
+      }
+      i = j;
+      continue;
+    }
+    if (ch === ':' ) { tokens.push({ type: 'colon', value: ch }); i++; continue; }
+    if (ch === ',' ) { tokens.push({ type: 'comma', value: ch }); i++; continue; }
+    if (ch === '(' ) { tokens.push({ type: 'lparen', value: ch }); i++; continue; }
+    if (ch === ')' ) { tokens.push({ type: 'rparen', value: ch }); i++; continue; }
+    if ('+-*/'.indexOf(ch) >= 0) { tokens.push({ type: 'op', value: ch }); i++; continue; }
+    throw new Error('bad char');
+  }
+  return tokens;
+}
+
+function resolveCellRef(name) {
+  const rc = nameToRC[name.toUpperCase()];
+  if (!rc) throw new Error('bad cell');
+  return rc;
+}
+
+// Parse range "A1:A10" (single cell also allowed) -> list of {r,c}
+function parseRange(tokens, pos, end) {
+  // Expects a cell token at pos
+  if (tokens[pos].type !== 'cell') throw new Error('expected cell');
+  const start = resolveCellRef(tokens[pos].value);
+  let cellsList = [start];
+  if (pos + 1 < end && tokens[pos+1].type === 'colon') {
+    if (pos + 2 >= end || tokens[pos+2].type !== 'cell') throw new Error('bad range');
+    const endCell = resolveCellRef(tokens[pos+2].value);
+    cellsList = [];
+    const r1 = Math.min(start.r, endCell.r), r2 = Math.max(start.r, endCell.r);
+    const c1 = Math.min(start.c, endCell.c), c2 = Math.max(start.c, endCell.c);
+    for (let r = r1; r <= r2; r++) {
+      for (let c = c1; c <= c2; c++) {
+        cellsList.push({ r, c });
+      }
+    }
+    return { list: cellsList, newPos: pos + 3 };
+  }
+  return { list: cellsList, newPos: pos + 1 };
+}
+
+// AST node types: num, ref, range, func, binop, unop
+function parseAddSub(tokens, pos, end) {
+  let left = parseMulDiv(tokens, pos, end);
+  let leftNode = left.node;
+  let i = left.newPos;
+  while (i < end && tokens[i].type === 'op' && (tokens[i].value === '+' || tokens[i].value === '-')) {
+    const op = tokens[i].value;
+    const right = parseMulDiv(tokens, i + 1, end);
+    leftNode = { type: 'binop', op, left: leftNode, right: right.node };
+    i = right.newPos;
+  }
+  return { node: leftNode, newPos: i };
+}
+
+function parseMulDiv(tokens, pos, end) {
+  let left = parsePrimary(tokens, pos, end);
+  let leftNode = left.node;
+  let i = left.newPos;
+  while (i < end && tokens[i].type === 'op' && (tokens[i].value === '*' || tokens[i].value === '/')) {
+    const op = tokens[i].value;
+    const right = parsePrimary(tokens, i + 1, end);
+    leftNode = { type: 'binop', op, left: leftNode, right: right.node };
+    i = right.newPos;
+  }
+  return { node: leftNode, newPos: i };
+}
+
+function parsePrimary(tokens, pos, end) {
+  if (pos >= end) throw new Error('unexpected end');
+  const t = tokens[pos];
+  if (t.type === 'num') {
+    return { node: { type: 'num', value: t.value }, newPos: pos + 1 };
+  }
+  if (t.type === 'cell') {
+    const rr = parseRange(tokens, pos, end);
+    if (rr.list.length === 1 && rr.newPos === pos + 1) {
+      return { node: { type: 'ref', r: rr.list[0].r, c: rr.list[0].c }, newPos: rr.newPos };
+    }
+    return { node: { type: 'range', list: rr.list }, newPos: rr.newPos };
+  }
+  if (t.type === 'func') {
+    if (pos + 1 >= end || tokens[pos+1].type !== 'lparen') throw new Error('expected (');
+    // collect args separated by comma until matching rparen
+    let i = pos + 2;
+    const args = [];
+    let depth = 1;
+    let argStart = i;
+    while (i < end) {
+      const tk = tokens[i];
+      if (tk.type === 'lparen') depth++;
+      else if (tk.type === 'rparen') {
+        depth--;
+        if (depth === 0) {
+          // final arg
+          if (i > argStart) args.push(tokens.slice(argStart, i));
+          break;
+        }
+      } else if (tk.type === 'comma' && depth === 1) {
+        args.push(tokens.slice(argStart, i));
+        argStart = i + 1;
+      }
+      i++;
+    }
+    if (i >= end || tokens[i].type !== 'rparen') throw new Error('expected )');
+    if (args.length === 0) throw new Error('empty args');
+    const argNodes = [];
+    for (const a of args) {
+      // Try to parse as range first (cell:cell)
+      // Detect range by scanning for colon at depth 0
+      let depth2 = 0;
+      let colonIdx = -1;
+      for (let k = 0; k < a.length; k++) {
+        if (a[k].type === 'lparen') depth2++;
+        else if (a[k].type === 'rparen') depth2--;
+        else if (a[k].type === 'colon' && depth2 === 0) { colonIdx = k; break; }
+      }
+      if (colonIdx !== -1) {
+        const startTok = a[0];
+        const endTok = a[colonIdx + 1];
+        if (startTok.type !== 'cell' || endTok.type !== 'cell') throw new Error('bad range');
+        const r1 = resolveCellRef(startTok.value), r2 = resolveCellRef(endTok.value);
+        const cellsList = [];
+        const minR = Math.min(r1.r, r2.r), maxR = Math.max(r1.r, r2.r);
+        const minC = Math.min(r1.c, r2.c), maxC = Math.max(r1.c, r2.c);
+        for (let r = minR; r <= maxR; r++) for (let c = minC; c <= maxC; c++) cellsList.push({ r, c });
+        argNodes.push({ type: 'range', list: cellsList });
+      } else if (a.length === 1 && a[0].type === 'cell') {
+        const rc = resolveCellRef(a[0].value);
+        argNodes.push({ type: 'ref', r: rc.r, c: rc.c });
+      } else if (a.length === 1 && a[0].type === 'num') {
+        argNodes.push({ type: 'num', value: a[0].value });
+      } else {
+        // full expression argument
+        const parsed = parseAddSub(a, 0, a.length);
+        if (parsed.newPos !== a.length) throw new Error('bad arg');
+        argNodes.push(parsed.node);
+      }
+    }
+    return { node: { type: 'func', name: t.value, args: argNodes }, newPos: i + 1 };
+  }
+  if (t.type === 'lparen') {
+    const inner = parseAddSub(tokens, pos + 1, end);
+    if (inner.newPos >= end || tokens[inner.newPos].type !== 'rparen') throw new Error('expected )');
+    return { node: inner.node, newPos: inner.newPos + 1 };
+  }
+  if (t.type === 'op' && t.value === '-') {
+    const operand = parsePrimary(tokens, pos + 1, end);
+    return { node: { type: 'unop', op: '-', child: operand.node }, newPos: operand.newPos };
+  }
+  if (t.type === 'op' && t.value === '+') {
+    return parsePrimary(tokens, pos + 1, end);
+  }
+  throw new Error('unexpected token');
+}
+
+function parseFormula(input) {
+  const tokens = tokenize(input);
+  if (tokens.length === 0) throw new Error('empty formula');
+  const result = parseAddSub(tokens, 0, tokens.length);
+  if (result.newPos !== tokens.length) throw new Error('trailing tokens');
+  return result.node;
+}
+
+// Extract direct references (cells) from AST, to build dependency graph
+function collectRefs(node, set) {
+  if (!node) return;
+  switch (node.type) {
+    case 'ref':
+      set.add(node.r + "," + node.c);
+      break;
+    case 'range':
+      for (const c of node.list) set.add(c.r + "," + c.c);
+      break;
+    case 'func':
+      for (const a of node.args) collectRefs(a, set);
+      break;
+    case 'binop':
+      collectRefs(node.left, set); collectRefs(node.right, set);
+      break;
+    case 'unop':
+      collectRefs(node.child, set);
+      break;
+  }
+}
+
+// Evaluate AST for a given cell (for circular detection, track visiting set)
+function evalNode(node, visiting, evalStack) {
+  switch (node.type) {
+    case 'num': return node.value;
+    case 'ref':
+      return evalCell(node.r, node.c, visiting);
+    case 'range':
+      // evaluate each cell value as number (for SUM/AVERAGE etc), non-numeric ignored
+      {
+        const vals = [];
+        for (const c of node.list) {
+          const v = getCellNumericValue(c.r, c.c, visiting, evalStack);
+          if (v !== null) vals.push(v);
+        }
+        return vals; // array
+      }
+    case 'func': {
+      // evaluate each arg to either number or array
+      const flat = [];
+      for (const a of node.args) {
+        const v = evalNode(a, visiting, evalStack);
+        if (Array.isArray(v)) {
+          for (const x of v) flat.push(x);
+        } else {
+          flat.push(v);
+        }
+      }
+      const name = node.name;
+      if (name === 'SUM') {
+        return flat.reduce((s, x) => s + x, 0);
+      } else if (name === 'AVERAGE') {
+        if (flat.length === 0) return 0;
+        return flat.reduce((s, x) => s + x, 0) / flat.length;
+      } else if (name === 'MIN') {
+        if (flat.length === 0) return 0;
+        return Math.min(...flat);
+      } else if (name === 'MAX') {
+        if (flat.length === 0) return 0;
+        return Math.max(...flat);
+      } else if (name === 'COUNT') {
+        return flat.length;
+      }
+      throw new Error('unknown func');
+    }
+    case 'binop': {
+      const l = evalNode(node.left, visiting, evalStack);
+      const r = evalNode(node.right, visiting, evalStack);
+      if (Array.isArray(l) || Array.isArray(r)) throw new Error('array in binary op');
+      switch (node.op) {
+        case '+': return l + r;
+        case '-': return l - r;
+        case '*': return l * r;
+        case '/':
+          if (r === 0) throw { div0: true };
+          return l / r;
+      }
+      throw new Error('bad op');
+    }
+    case 'unop': {
+      const v = evalNode(node.child, visiting, evalStack);
+      return node.op === '-' ? -v : v;
+    }
+  }
+  throw new Error('bad node');
+}
+
+// Get numeric value of a cell for reference/range evaluation.
+// Returns number or null if cell empty/text. Throws on error/circular.
+function getCellNumericValue(r, c, visiting, evalStack) {
+  const cell = cells[r][c];
+  if (!cell) return null;
+  if (cell.error === 'circular') return null; // treat circular as not numeric (but will surface where evaluated)
+  if (cell.error === 'div0' || cell.error === 'error') return null;
+  if (cell.kind === 'formula') {
+    // evaluate formula, possibly re-evaluating
+    return evalFormulaCell(r, c, visiting, evalStack);
+  }
+  // literal
+  if (cell.kind === 'number') return cell.num;
+  return null; // text or empty
+}
+
+// Evaluate a direct cell reference as a number. Empty cells are 0.
+// Propagates errors/circulars so dependents show the right indicator.
+function evalCell(r, c, visiting) {
+  const cell = cells[r][c];
+  if (!cell) return 0;
+  if (cell.error === 'circular') throw { circular: true };
+  if (cell.error === 'div0') throw { div0: true };
+  if (cell.error === 'error') throw { err: true };
+  if (cell.kind === 'number') return cell.num;
+  if (cell.kind === 'formula') return evalFormulaCell(r, c, visiting);
+  // text cell: use numeric value if it parses as a number, else 0
+  const n = parseFloat(String(cell.text));
+  return isNaN(n) ? 0 : n;
+}
+
+// Evaluate a formula cell's value.
+function evalFormulaCell(r, c, visiting, evalStack) {
+  const key = r + "," + c;
+  if (visiting.has(key)) {
+    throw { circular: true };
+  }
+  const cell = cells[r][c];
+  if (cell.kind !== 'formula') {
+    return cell.kind === 'number' ? cell.num : null;
+  }
+  visiting.add(key);
+  try {
+    const val = evalNode(cell.ast, visiting, evalStack);
+    return val;
+  } finally {
+    visiting.delete(key);
+  }
+}
+
+// ---------- Rendering & editing ----------
+function buildGrid() {
+  const table = document.getElementById('grid');
+  table.innerHTML = '';
+  // header row
+  const thead = document.createElement('thead');
+  const htr = document.createElement('tr');
+  const corner = document.createElement('th');
+  corner.className = 'corner';
+  htr.appendChild(corner);
+  for (let c = 0; c < COLS; c++) {
+    const th = document.createElement('th');
+    th.className = 'colhead';
+    th.textContent = COL_LETTERS[c];
+    htr.appendChild(th);
+  }
+  thead.appendChild(htr);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (let r = 0; r < ROWS; r++) {
+    const tr = document.createElement('tr');
+    const rth = document.createElement('th');
+    rth.className = 'rowhead';
+    rth.textContent = (r + 1);
+    tr.appendChild(rth);
+    for (let c = 0; c < COLS; c++) {
+      const td = document.createElement('td');
+      td.dataset.r = r;
+      td.dataset.c = c;
+      td.setAttribute('tabindex', '0');
+      td.addEventListener('mousedown', onCellMouseDown);
+      td.addEventListener('dblclick', onCellDblClick);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+}
+
+let editingCell = null; // element ref while editing
+
+function renderCell(r, c) {
+  const td = document.querySelector('td[data-r="' + r + '"][data-c="' + c + '"]');
+  if (!td) return;
+  const cell = cells[r][c];
+  td.textContent = '';
+  td.classList.remove('error');
+  if (cell) {
+    if (cell.error === 'circular') {
+      td.textContent = '#CIRCULAR!';
+      td.classList.add('error');
+    } else if (cell.error === 'div0') {
+      td.textContent = '#DIV/0!';
+      td.classList.add('error');
+    } else if (cell.error === 'error') {
+      td.textContent = '#ERROR!';
+      td.classList.add('error');
+    } else if (cell.display !== undefined && cell.display !== null) {
+      td.textContent = cell.display;
+    }
+  }
+}
+
+function displayValueFor(cell) {
+  if (!cell) return '';
+  if (cell.error === 'circular') return '#CIRCULAR!';
+  if (cell.error === 'div0') return '#DIV/0!';
+  if (cell.error === 'error') return '#ERROR!';
+  return (cell.display === undefined || cell.display === null) ? '' : String(cell.display);
+}
+
+function computeCell(r, c) {
+  const cell = cells[r][c];
+  if (!cell) return;
+  if (cell.kind === 'number') {
+    cell.display = cell.num;
+    cell.error = null;
+    return;
+  }
+  if (cell.kind === 'text') {
+    cell.display = cell.text;
+    cell.error = null;
+    return;
+  }
+  // formula
+  if (!cell.ast) {
+    cell.error = 'error';
+    cell.display = null;
+    return;
+  }
+  try {
+    const val = evalFormulaCell(r, c, new Set());
+    if (typeof val === 'number') {
+      cell.error = null;
+      cell.display = val;
+    } else {
+      cell.error = 'error';
+      cell.display = null;
+    }
+  } catch (e) {
+    if (e && e.circular) {
+      cell.error = 'circular';
+      cell.display = null;
+    } else if (e && e.div0) {
+      cell.error = 'div0';
+      cell.display = null;
+    } else {
+      cell.error = 'error';
+      cell.display = null;
+    }
+  }
+}
+
+// Dependency tracking
+const dependents = {}; // "r,c" -> Set of "r,c" dependents
+function clearDependents() {
+  for (const k in dependents) delete dependents[k];
+}
+function addDependent(sourceKey, depKey) {
+  if (!dependents[sourceKey]) dependents[sourceKey] = new Set();
+  dependents[sourceKey].add(depKey);
+}
+function buildDeps() {
+  clearDependents();
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const cell = cells[r][c];
+      if (cell && cell.kind === 'formula' && cell.ast) {
+        const refs = new Set();
+        collectRefs(cell.ast, refs);
+        for (const refKey of refs) {
+          addDependent(refKey, r + "," + c);
+        }
+      }
+    }
+  }
+}
+
+function recalcAffected(changedKeys) {
+  // collect all affected (changed + dependents transitively)
+  const affected = new Set();
+  const queue = [...changedKeys];
+  while (queue.length) {
+    const k = queue.shift();
+    if (affected.has(k)) continue;
+    affected.add(k);
+    if (dependents[k]) {
+      for (const d of dependents[k]) queue.push(d);
+    }
+  }
+  for (const k of affected) {
+    const [r, c] = k.split(',').map(Number);
+    computeCell(r, c);
+  }
+  for (const k of affected) {
+    const [r, c] = k.split(',').map(Number);
+    renderCell(r, c);
+  }
+}
+
+function updateFormulaBar() {
+  const cell = cells[selectedR][selectedC];
+  const namebox = document.getElementById('namebox');
+  namebox.value = rcToName[selectedR + "," + selectedC];
+  const fbar = document.getElementById('formula-bar');
+  if (!editing) {
+    fbar.value = cell && cell.raw !== undefined ? cell.raw : '';
+  }
+}
+
+function setCell(r, c, raw) {
+  const key = r + "," + c;
+  const trimmed = raw.trim();
+  if (trimmed === '') {
+    cells[r][c] = undefined;
+  } else if (trimmed[0] === '=') {
+    const body = trimmed.slice(1);
+    let cell;
+    try {
+      const ast = parseFormula(body);
+      cell = { kind: 'formula', raw: trimmed, ast: ast, display: null, error: null };
+    } catch (e) {
+      cell = { kind: 'formula', raw: trimmed, ast: null, display: null, error: 'error' };
+    }
+    cells[r][c] = cell;
+  } else if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
+    cells[r][c] = { kind: 'number', raw: trimmed, num: parseFloat(trimmed), display: parseFloat(trimmed), error: null };
+  } else {
+    cells[r][c] = { kind: 'text', raw: trimmed, text: trimmed, display: trimmed, error: null };
+  }
+  buildDeps();
+  recalcAffected([key]);
+}
+
+function onCellMouseDown(e) {
+  const td = e.currentTarget;
+  selectCell(parseInt(td.dataset.r), parseInt(td.dataset.c));
+}
+
+function onCellDblClick(e) {
+  const td = e.currentTarget;
+  startEditing(parseInt(td.dataset.r), parseInt(td.dataset.c));
+}
+
+function selectCell(r, c) {
+  document.querySelectorAll('td.selected').forEach(td => td.classList.remove('selected'));
+  selectedR = r; selectedC = c;
+  const td = document.querySelector('td[data-r="' + r + '"][data-c="' + c + '"]');
+  if (td) {
+    td.classList.add('selected');
+    td.focus();
+  }
+  updateFormulaBar();
+}
+
+function startEditing(r, c) {
+  if (editing) setCell(editR, editC, fbar.value);
+  selectedR = r; selectedC = c;
+  editR = r; editC = c;
+  editing = true;
+  const cell = cells[r][c];
+  const fbar = document.getElementById('formula-bar');
+  fbar.value = cell && cell.raw !== undefined ? cell.raw : '';
+  fbar.focus();
+  fbar.select();
+  updateFormulaBar();
+}
+
+// ---------- Interaction ----------
+// The formula bar handles its own keys (Enter/Tab/Escape) and marks them
+// defaultPrevented. A single document-level handler covers grid navigation
+// and typing, so it works no matter which cell (or body) has focus.
+const fbar = document.getElementById('formula-bar');
+
+fbar.addEventListener('focus', () => {
+  editing = true;
+  formulaFocus = true;
+  updateFormulaBar();
+});
+
+fbar.addEventListener('blur', () => {
+  // Commit the edit being entered in the formula bar.
+  if (editing) {
+    setCell(editR, editC, fbar.value);
+    editing = false;
+  }
+  formulaFocus = false;
+  updateFormulaBar();
+});
+
+fbar.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    setCell(editR, editC, fbar.value);
+    editing = false;
+    moveSelection(1, 0); // down
+    updateFormulaBar();
+  } else if (e.key === 'Tab') {
+    e.preventDefault();
+    setCell(editR, editC, fbar.value);
+    editing = false;
+    moveSelection(0, 1); // right
+    updateFormulaBar();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    editing = false;
+    updateFormulaBar();
+    fbar.blur();
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  // If the formula bar already handled this key, skip.
+  if (e.defaultPrevented) return;
+  // Don't hijack typing while the formula bar is focused.
+  if (document.activeElement === fbar) return;
+
+  if (e.key === 'ArrowUp' || e.key === 'ArrowDown' ||
+      e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    e.preventDefault();
+    const dr = e.key === 'ArrowUp' ? -1 : e.key === 'ArrowDown' ? 1 : 0;
+    const dc = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0;
+    moveSelection(dr, dc);
+    return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    moveSelection(1, 0);
+    return;
+  }
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    moveSelection(0, 1);
+    return;
+  }
+  if (e.key === 'Backspace' || e.key === 'Delete') {
+    e.preventDefault();
+    setCell(selectedR, selectedC, '');
+    updateFormulaBar();
+    return;
+  }
+  // Printable character starts editing the selected cell.
+  if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    startTyping(e.key);
+  }
+});
+
+function startTyping(ch) {
+  const fbar = document.getElementById('formula-bar');
+  editR = selectedR; editC = selectedC;
+  fbar.value = ch;
+  fbar.focus();
+  editing = true;
+  fbar.setSelectionRange(fbar.value.length, fbar.value.length);
+  updateFormulaBar();
+}
+
+function moveSelection(dr, dc) {
+  selectedR = Math.max(0, Math.min(ROWS - 1, selectedR + dr));
+  selectedC = Math.max(0, Math.min(COLS - 1, selectedC + dc));
+  selectCell(selectedR, selectedC);
+}
+
+// Initialize
+buildGrid();
+selectCell(0, 0);
+</script>
+</body>
+</html>
