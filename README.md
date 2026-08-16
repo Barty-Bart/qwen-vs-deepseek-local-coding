@@ -2,6 +2,10 @@
 
 Same prompts, same machine, same day. Everything ran locally.
 
+### Watch the full test
+
+[![Watch the full test on YouTube](https://img.youtube.com/vi/4eBxA6UGXAo/maxresdefault.jpg)](https://youtu.be/4eBxA6UGXAo)
+
 | | Model | Size | Active/token | Memory | Speed |
 |---|---|---|---|---|---|
 | **Qwen** | Qwen3.8-27B 8-bit | 27B dense | 27B | 31 GB | 44 tok/s |
