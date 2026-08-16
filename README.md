@@ -27,11 +27,32 @@ output. Open the `.html` files directly in a browser.
 
 ## Timings
 
+**Thinking off** — one prompt, no feedback:
+
 | Test | DeepSeek | Qwen |
 |---|---|---|
 | 01 weather | 2m 17s, 3 turns | 7m 48s, 7 turns |
 | 02 tower defence | 4m 12s, 10 turns | 6m 01s, 7 turns |
-| 03 spreadsheet | 3m 51s, 6 turns | ~14m |
 
-Thinking was **off** for tests 01, 02 and 03. Test 3.1 turns it on — see the
+**Test 03**, spreadsheet — neither worked first time, so this is the total across
+the original build plus two rounds of feedback:
+
+| | Round 1 | Round 2 | Round 3 | **Total** | Working? |
+|---|---|---|---|---|---|
+| DeepSeek | 3m 51s | 8m 38s | 10m 03s | **22m 32s** | no |
+| Qwen | ~14m | 10m 46s | 16m 08s | **~41m** | yes, after round 3 |
+
+Qwen's round 1 is approximate: it hung for ~10 minutes on a test harness it
+wrote itself, and the session was resumed rather than restarted.
+
+**Test 3.1** — same original prompt, fresh session, **thinking on** at
+`reasoning_effort: low`. One shot, no feedback:
+
+| | Time | Turns | Working? |
+|---|---|---|---|
+| DeepSeek | **12m 49s** | 44 | formulas yes, cell selection broken past row 1 |
+| Qwen | **34m 56s** | 10 | yes |
+
+So thinking on got DeepSeek closer in 12m 49s than 22m 32s of debugging did, and
+got Qwen a working result in 34m 56s against ~41m. Details in the
 [03 notes](03-hard-spreadsheet/README.md).
